@@ -66,6 +66,10 @@ Zed / ACP client
 - One interactive `agy` PTY per ACP session; conversation id is learned on the first turn
   and reused. PTY output is a diagnostic tail only — never parsed as agent text.
 - Steps come from agy's conversation SQLite DB (structured protobuf records), not stdout.
+- Interactive turn completion requires a terminal database step and a fresh
+  native idle footer; the first footer of a fresh TUI is treated as startup.
+  If the deadline expires without that confirmation,
+  the adapter reports an error and stops the PTY instead of claiming `end_turn`.
 - Config options: `mode` → `--mode`, `model` → `--model`, `reasoningEffort` → `--effort`
 - Cancel: `SIGINT` then `SIGKILL`. `--sandbox` on by default; skip-permissions is opt-in.
 - Session bindings persist under `~/.agy-acp-state` so list/load/resume survive restarts.

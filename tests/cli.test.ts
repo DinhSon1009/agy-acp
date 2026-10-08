@@ -541,6 +541,26 @@ describe("permission bridge", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  it("does not report a denied tool as completed when agy never redraws its idle footer", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-acp-pty-denied-no-idle-"));
+    const pty = new FakePty(() => {
+      const db = createConversationDb(dir, "denied-no-idle");
+      insertStep(db, pendingToolRow("run_command", '{"CommandLine":"git reset"}'));
+      db.close();
+    });
+    pty.emitIdleMarkerOnStart = false;
+    const session = interactiveSession(dir, pty, "250ms");
+    await expect(session.prompt("go", async () => {}, async () => {
+      const db = new (await import("better-sqlite3")).default(path.join(dir, "denied-no-idle.db"));
+      updateStep(db, 1, { status: 7 });
+      db.close();
+      return "agy-reject-once";
+    })).rejects.toThrow("terminal database step had no confirmed native idle marker");
+    expect(pty.killed).toBe(true);
+    await session.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it("completes a tool-only turn promptly after quiescence without waiting for long printTimeout", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-acp-pty-tool-only-"));
     const pty = new FakePty(() => {
@@ -558,6 +578,7 @@ describe("permission bridge", () => {
     // Set a very long timeout (60s). Must resolve via quiescence in < 2s rather than waiting 60s.
     const session = interactiveSession(dir, pty, "60s");
     const startTime = Date.now();
+    setTimeout(() => pty.emitData("? for shortcuts"), 50);
     const result = await session.prompt("echo hello", async () => {}, async () => "agy-allow-once");
     const elapsed = Date.now() - startTime;
     expect(result.stopReason).toBe("end_turn");
@@ -651,6 +672,7 @@ describe("permission bridge", () => {
       })
     });
     db.close();
+    setTimeout(() => pty.emitData("? for shortcuts"), 50);
 
     expect((await result).stopReason).toBe("end_turn");
     const textChunks = updates
@@ -771,6 +793,7 @@ describe("permission bridge", () => {
     const db = new (await import("better-sqlite3")).default(path.join(dir, "startup-marker.db"));
     updateStep(db, 1, { status: 3, stepPayload: encodeStepPayload({ agentText: "done" }) });
     db.close();
+    pty.emitData("? for shortcuts");
     expect((await result).stopReason).toBe("end_turn");
     await session.close();
     fs.rmSync(dir, { recursive: true, force: true });
@@ -784,7 +807,6 @@ describe("permission bridge", () => {
       insertStep(db, { idx: 2, stepType: 15, status: 3, stepPayload: encodeStepPayload({ agentText: "done" }) });
       db.close();
     });
-    pty.emitIdleMarkerOnStart = false;
     const session = interactiveSession(dir, pty);
     let resolved = false;
     const result = session.prompt("go", async () => {}, async () => "agy-allow-once")
@@ -870,9 +892,7 @@ describe("permission bridge", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it("stops the PTY when soft-timing out on a terminal DB row without completion markers", async () => {
-    // Codex review: turnCompleteCandidate timeout must not leave the interactive
-    // PTY alive for the next client prompt to join mid-turn.
+  it("reports a terminal DB row without a native idle marker as an uncertain turn", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-acp-pty-soft-timeout-"));
     const pty = new FakePty(() => {
       const db = createConversationDb(dir, "soft-timeout");
@@ -885,17 +905,16 @@ describe("permission bridge", () => {
       });
       db.close();
     });
-    // Startup marker only — never the post-turn redraw, and latest step is an
-    // intermediate successful tool (not conclusive for the single-marker shortcut).
+    // Only the TUI startup footer arrives, never a confirmed post-turn redraw.
     const session = interactiveSession(dir, pty, "250ms");
-    const result = await session.prompt("go", async () => {}, async () => "agy-allow-once");
-    expect(result.stopReason).toBe("end_turn");
+    await expect(session.prompt("go", async () => {}, async () => "agy-allow-once"))
+      .rejects.toThrow("terminal database step had no confirmed native idle marker");
     expect(pty.killed).toBe(true);
     await session.close();
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it("falls back cleanly to end_turn when background completion row is missing and deadline expires", async () => {
+  it("reports an unconfirmed background completion when its deadline expires", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-acp-pty-bg-timeout-"));
     const pty = new FakePty(() => {
       const db = createConversationDb(dir, "bg-timeout");
@@ -917,13 +936,13 @@ describe("permission bridge", () => {
         })
       });
       db.close();
-      // Idle markers arrive, but no completion row — deadline must still expire and fall back cleanly to end_turn.
+      // Idle markers arrive, but no completion row — the deadline must not claim success.
       setTimeout(() => pty.emitData("? for shortcuts"), 20);
     });
 
     const session = interactiveSession(dir, pty, "250ms");
-    const result = await session.prompt("run bg", async () => {}, async () => "agy-allow-once");
-    expect(result.stopReason).toBe("end_turn");
+    await expect(session.prompt("run bg", async () => {}, async () => "agy-allow-once"))
+      .rejects.toThrow("background task completion was not observed");
     expect(pty.writes).toEqual([]);
     await session.close();
     fs.rmSync(dir, { recursive: true, force: true });
@@ -978,7 +997,7 @@ describe("permission bridge", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it("settles cleanly via quiescence window when terminal DB rows exist even without PTY idle marker", async () => {
+  it("does not treat a terminal text row as complete without a native idle marker", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-acp-pty-quiescence-"));
     const pty = new FakePty(() => {
       const db = createConversationDb(dir, "quiesce-test");
@@ -989,16 +1008,14 @@ describe("permission bridge", () => {
         stepPayload: encodeStepPayload({ agentText: "Response ready." })
       });
       db.close();
-      // No PTY idle marker is emitted after spawn. Turn must complete via quiescence window (~300ms)
-      // rather than hanging until printTimeout (5s).
+      // The database text row alone cannot prove the native CLI returned to its prompt.
     });
 
-    const session = interactiveSession(dir, pty, "5s");
-    const start = Date.now();
-    const result = await session.prompt("ask", async () => {}, async () => "agy-allow-once");
-    const elapsed = Date.now() - start;
-    expect(result.stopReason).toBe("end_turn");
-    expect(elapsed).toBeLessThan(2_000);
+    pty.emitIdleMarkerOnStart = false;
+    const session = interactiveSession(dir, pty, "250ms");
+    await expect(session.prompt("ask", async () => {}, async () => "agy-allow-once"))
+      .rejects.toThrow("terminal database step had no confirmed native idle marker");
+    expect(pty.killed).toBe(true);
     await session.close();
     fs.rmSync(dir, { recursive: true, force: true });
   });
@@ -1163,6 +1180,7 @@ describe("permission bridge", () => {
       updateStep(db, 1, { status: 3 });
       insertStep(db, { idx: 2, stepType: 15, status: 3, stepPayload: encodeStepPayload({ agentText: "done" }) });
       db.close();
+      setTimeout(() => pty.emitData("? for shortcuts"), 50);
       return "agy-allow-once";
     });
 
@@ -1194,6 +1212,7 @@ describe("permission bridge", () => {
       updateStep(db, 1, { status: 3 });
       insertStep(db, { idx: 2, stepType: 15, status: 3, stepPayload: encodeStepPayload({ agentText: "done" }) });
       db.close();
+      setTimeout(() => pty.emitData("? for shortcuts"), 50);
       return "agy-allow-once";
     });
 
@@ -1227,6 +1246,7 @@ describe("permission bridge", () => {
     // Normal command stdout contains phrase "Allow once" without menu context
     pty.emitData("Please Allow once in your config file\nDone.\n");
 
+    setTimeout(() => pty.emitData("? for shortcuts"), 50);
     const result = await session.prompt("check", async () => {}, async () => "agy-allow-once");
     expect(result.stopReason).toBe("end_turn");
     // Should NOT have sent premature permission keys
@@ -1249,6 +1269,7 @@ describe("permission bridge", () => {
     });
     const session = interactiveSession(dir, pty, "5s");
     const start = Date.now();
+    setTimeout(() => pty.emitData("? for shortcuts"), 50);
     const result = await session.prompt("ask", async () => {}, async () => "agy-allow-once");
     const elapsed = Date.now() - start;
     expect(result.stopReason).toBe("end_turn");
@@ -1423,6 +1444,7 @@ describe("permission bridge", () => {
             stepPayload: encodeStepPayload({ agentText: "Late summary: long job finished" })
           });
           db2.close();
+          pty.emitData("? for shortcuts");
         }, 400);
       }, 30);
     });
@@ -1772,6 +1794,7 @@ describe("permission bridge", () => {
         updateStep(db, 1, { status: 3 });
         insertStep(db, { idx: 2, stepType: 15, status: 3, stepPayload: encodeStepPayload({ agentText: "done" }) });
         db.close();
+        setTimeout(() => pty.emitData("? for shortcuts"), 50);
         return choice;
       });
 

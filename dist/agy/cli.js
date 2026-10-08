@@ -120,6 +120,7 @@ export class AgyCliSession {
     #ptyPermissionRender = "";
     #ptyPermissionMarkerTail = "";
     #ptyIdleMarkerAt = 0;
+    #ptyIdleMarkerCount = 0;
     #ptyIdleMarkerTail = "";
     #ptyPermissionRenderTimer;
     #activeStreamPoller;
@@ -318,6 +319,7 @@ export class AgyCliSession {
             this.#ptyPermissionRender = "";
             this.#ptyPermissionMarkerTail = "";
             this.#ptyIdleMarkerAt = 0;
+            this.#ptyIdleMarkerCount = 0;
             this.#ptyIdleMarkerTail = "";
             const activePty = this.#pty;
             activePty.onData((data) => {
@@ -327,8 +329,13 @@ export class AgyCliSession {
                 // idleData/idleClean scan at the #ptyPermissionRender anchor below.
                 const { completed: turnIdleData, incomplete: turnIdleIncomplete } = splitIncompleteAnsi(this.#ptyIdleMarkerTail + data);
                 const turnIdleClean = turnIdleData.replace(/\x1b\[[0-9;?]*[a-zA-Z]|\x1b\].*?\x07|\x1b[()][AB012]/g, "");
-                if (turnIdleClean.includes(TURN_IDLE_MARKER))
-                    this.#ptyIdleMarkerAt = Date.now();
+                // The first footer belongs to the fresh TUI startup. Only a later
+                // repaint can confirm a turn's return to the native prompt.
+                if (turnIdleClean.includes(TURN_IDLE_MARKER)) {
+                    this.#ptyIdleMarkerCount++;
+                    if (this.#ptyIdleMarkerCount >= 2)
+                        this.#ptyIdleMarkerAt = Date.now();
+                }
                 this.#ptyIdleMarkerTail = markerPrefixTail(turnIdleClean, TURN_IDLE_MARKER) + turnIdleIncomplete;
                 this.#ptyPermissionRender = (this.#ptyPermissionRender + data).slice(-16_384);
                 if (this.#ptyPermissionRenderTimer)
@@ -389,13 +396,6 @@ export class AgyCliSession {
                 }
                 if (updates.length > 0) {
                     lastActivityTime = Date.now();
-                }
-                if (Date.now() >= deadline) {
-                    if (poller.turnCompleteCandidate && poller.lastStepIdx > this.#lastStepIdx) {
-                        await this.stopPty();
-                        break;
-                    }
-                    throw new AgyCliError(turnTimeoutMessage(this.config.printTimeout, poller), [this.config.agyPath], null, this.#ptyOutput);
                 }
                 for (const update of updates)
                     await this.raceTurnCallback(onUpdate(update), deadline);
@@ -580,22 +580,25 @@ export class AgyCliSession {
                     (poller.isConclusiveTurnEnd ||
                         poller.isSuccessfulToolOnlyEnd ||
                         deniedEndMarker);
-                if (isIdleCandidate) {
+                if (isIdleCandidate && !poller.hasActiveBackgroundTasks) {
                     deniedTurnComplete =
                         deniedEndMarker &&
                             !poller.isConclusiveTurnEnd &&
                             !poller.isSuccessfulToolOnlyEnd;
+                    break;
+                }
+                if (Date.now() >= deadline) {
+                    throw new AgyCliError(turnTimeoutMessage(this.config.printTimeout, poller), [this.config.agyPath], null, this.#ptyOutput);
+                }
+                if (isIdleCandidate) {
                     // Background work can finish after the TUI looks idle. Stay on this
                     // user turn and keep polling — do not inject a synthetic "continue".
                     // Do not re-arm deadline here: only poller revision progress (above)
                     // refreshes the timeout, so a missing completion cannot hang forever.
-                    if ((poller.hasActiveBackgroundTasks || !poller.turnCompleteCandidate) && !this.#cancelled) {
-                        const exited = await Promise.race([activePtyExit.then(() => true), sleep(POLL_INTERVAL_MS).then(() => false)]);
-                        if (exited && !this.#cancelled)
-                            throw new AgyCliError(`agy interactive PTY exited unexpectedly: ${this.#ptyOutput.trim() || "<no output>"}`, [this.config.agyPath], null, this.#ptyOutput);
-                        continue;
-                    }
-                    break;
+                    const exited = await Promise.race([activePtyExit.then(() => true), sleep(POLL_INTERVAL_MS).then(() => false)]);
+                    if (exited && !this.#cancelled)
+                        throw new AgyCliError(`agy interactive PTY exited unexpectedly: ${this.#ptyOutput.trim() || "<no output>"}`, [this.config.agyPath], null, this.#ptyOutput);
+                    continue;
                 }
                 const exited = await Promise.race([activePtyExit.then(() => true), sleep(POLL_INTERVAL_MS).then(() => false)]);
                 if (exited && !this.#cancelled)
@@ -1291,6 +1294,12 @@ function raceProcessError(promise, errorPromise, command) {
  */
 function turnTimeoutMessage(printTimeout, poller) {
     const base = `agy interactive turn timed out after ${printTimeout}; no final turn completion was observed`;
+    if (poller.hasActiveBackgroundTasks) {
+        return `${base}; background task completion was not observed`;
+    }
+    if (poller.turnCompleteCandidate) {
+        return `${base}; terminal database step had no confirmed native idle marker`;
+    }
     const stalled = poller.stalledStep;
     if (!stalled)
         return poller.hasRows ? base : `${base}; agy recorded no steps for this turn`;
