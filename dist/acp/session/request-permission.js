@@ -109,6 +109,8 @@ function selectedPermission(response, signal) {
         id === "agy-allow-conversation" ||
         id === "agy-allow-settings" ||
         id === "agy-reject-once" ||
+        id === "agy-reject-conversation" ||
+        id === "agy-reject-settings" ||
         id.startsWith("agy-q-")) {
         return id;
     }

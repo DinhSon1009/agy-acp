@@ -7,7 +7,7 @@ import type { SessionUpdate } from "@agentclientprotocol/sdk";
 export type PermissionChoice = string;
 export interface PermissionMenuOption {
     optionId: PermissionChoice;
-    kind: "allow_once" | "allow_always" | "reject_once";
+    kind: "allow_once" | "allow_always" | "reject_once" | "reject_always";
     name: string;
 }
 export interface AskQuestionPrompt {

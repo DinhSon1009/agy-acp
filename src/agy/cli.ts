@@ -507,6 +507,12 @@ export class AgyCliSession {
     // keep moving this boundary forward, so they can never satisfy the gate
     // for a later turn-complete candidate.
     let busyBoundaryAt = Date.now();
+    // Timestamp of the last gated permission the client denied. A denied
+    // tool can be the final DB row — agy returns to its prompt without
+    // generating recovery text — so a footer repaint newer than the deny
+    // also proves the turn ended.
+    let deniedInteractionAt = 0;
+    let deniedTurnComplete = false;
     let seenRevision = -1;
     let lastActivityTime = Date.now();
     let failed = false;
@@ -636,6 +642,9 @@ export class AgyCliSession {
                   this.#ptyOutput
                 );
               }
+              if (normalizePermissionChoice(choice).startsWith("agy-reject-")) {
+                deniedInteractionAt = Date.now();
+              }
               if (!await this.writePermissionKeys(keys)) break;
             }
             gateMarkerCounts.set(id, this.#ptyPermissionMarkerCount);
@@ -709,14 +718,24 @@ export class AgyCliSession {
         // redraw still resolves through the printTimeout deadline path
         // instead of hanging forever.
         const sawIdleMarker = this.#ptyIdleMarkerAt >= busyBoundaryAt;
+        // A denied tool can be the final DB row: the footer repaint after the
+        // deny decision is the only signal agy settled back at its prompt.
+        const deniedEndMarker =
+          deniedInteractionAt > 0 && this.#ptyIdleMarkerAt > deniedInteractionAt;
         const isIdleCandidate =
           poller.turnCompleteCandidate &&
           poller.lastStepIdx > this.#lastStepIdx &&
           candidateRevision === poller.revision &&
           hasQuiesced &&
           sawIdleMarker &&
-          (poller.isConclusiveTurnEnd || poller.isSuccessfulToolOnlyEnd);
+          (poller.isConclusiveTurnEnd ||
+            poller.isSuccessfulToolOnlyEnd ||
+            deniedEndMarker);
         if (isIdleCandidate) {
+          deniedTurnComplete =
+            deniedEndMarker &&
+            !poller.isConclusiveTurnEnd &&
+            !poller.isSuccessfulToolOnlyEnd;
           // Background work can finish after the TUI looks idle. Stay on this
           // user turn and keep polling — do not inject a synthetic "continue".
           // Do not re-arm deadline here: only poller revision progress (above)
@@ -736,7 +755,9 @@ export class AgyCliSession {
         // reuse its inactivity deadline for client notification/write-through.
         await this.reflectUnstructuredEdits(editBaseline, fsBridge, onUpdate);
       }
-      const detectedStopReason = poller.detectStopReason();
+      const detectedStopReason = deniedTurnComplete
+        ? "cancelled"
+        : poller.detectStopReason();
       const stopReason = this.#cancelled ? "cancelled" : detectedStopReason;
       const usage = poller.accumulatedTurnUsage();
       return { stopReason, usage };

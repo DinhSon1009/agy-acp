@@ -440,6 +440,47 @@ describe("permission bridge", () => {
     ]);
   });
 
+  it("bridges agy's call_mcp_tool gate as the six-row menu with a server/tool grant", () => {
+    const mcpCall = {
+      sessionUpdate: "tool_call" as const,
+      toolCallId: "mcp1",
+      title: "Call MCP tool",
+      kind: "other" as const,
+      status: "pending" as const,
+      rawInput: {
+        ServerName: "his",
+        ToolName: "his_query_execute"
+      }
+    };
+    expect(isBridgeablePermissionTool("call_mcp_tool")).toBe(true);
+    expect(canBridgeInteraction("call_mcp_tool", mcpCall)).toBe(true);
+    expect(permissionOptions(mcpCall, "call_mcp_tool")).toEqual([
+      { optionId: "agy-allow-once", kind: "allow_once", name: "Yes" },
+      { optionId: "agy-allow-conversation", kind: "allow_always", name: "Yes, and always allow 'his/his_query_execute' in this conversation" },
+      { optionId: "agy-allow-settings", kind: "allow_always", name: "Yes, and always allow 'his/his_query_execute' (Persist to settings.json)" },
+      { optionId: "agy-reject-once", kind: "reject_once", name: "No" },
+      { optionId: "agy-reject-conversation", kind: "reject_always", name: "No, and always deny 'his/his_query_execute' in this conversation" },
+      { optionId: "agy-reject-settings", kind: "reject_always", name: "No, and always deny 'his/his_query_execute' (Persist to settings.json)" }
+    ]);
+    expect(interactionKeys("agy-allow-once", "call_mcp_tool", mcpCall)).toBe("\r");
+    expect(interactionKeys("agy-reject-once", "call_mcp_tool", mcpCall)).toBe("\x1b[B\x1b[B\x1b[B\r");
+    expect(interactionKeys("agy-reject-conversation", "call_mcp_tool", mcpCall)).toBe("\x1b[B\x1b[B\x1b[B\x1b[B\r");
+    expect(interactionKeys("agy-reject-settings", "call_mcp_tool", mcpCall)).toBe("\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\r");
+
+    // Without ServerName/ToolName the grant label falls back to the title.
+    const mcpNoNames = {
+      sessionUpdate: "tool_call" as const,
+      toolCallId: "mcp2",
+      title: "his/his_log_search",
+      kind: "other" as const,
+      status: "pending" as const,
+      rawInput: {}
+    };
+    expect(permissionOptions(mcpNoNames, "call_mcp_tool")[4].name).toBe(
+      "No, and always deny 'his/his_log_search' in this conversation"
+    );
+  });
+
   for (const [choice, keys] of [
     ["agy-allow-once", "\r"],
     ["agy-allow-conversation", "\x1b[B\r"],
@@ -493,7 +534,8 @@ describe("permission bridge", () => {
       setTimeout(() => pty.emitData("? for shortcuts"), 150);
       return "agy-reject-once";
     });
-    expect((await result).stopReason).toBe("end_turn");
+    // A user denial ends the turn as cancelled, not a normal end_turn.
+    expect((await result).stopReason).toBe("cancelled");
     expect(pty.writes).toEqual(["\x1b[B", "\x1b[B", "\x1b[B", "\r"]);
     await session.close();
     fs.rmSync(dir, { recursive: true, force: true });

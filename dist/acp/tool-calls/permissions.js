@@ -14,6 +14,8 @@ export function isBridgeablePermissionTool(toolName) {
         return true;
     if (toolName === "manage_task")
         return true;
+    if (toolName === "call_mcp_tool")
+        return true;
     if (toolName === "view_file" || toolName === "list_dir")
         return true;
     if (isEditToolName(toolName))
@@ -159,6 +161,14 @@ export function interactionKeys(choice, toolName, toolCall, questionIndex = 0) {
             return keys;
         }
     }
+    // agy's MCP permission menu has six rows: the standard four plus two deny
+    // scopes (deny in this conversation, deny persisted to settings.json).
+    if (toolName === "call_mcp_tool") {
+        if (choice === "agy-reject-conversation")
+            return "\x1b[B".repeat(4) + "\r";
+        if (choice === "agy-reject-settings")
+            return "\x1b[B".repeat(5) + "\r";
+    }
     // Edit tools: map standard ACP allow/reject onto agy's 4-row menu.
     // Accept/allow-once → first row; always-allow → settings row; reject → last row.
     if (isEditToolName(toolName)) {
@@ -258,6 +268,40 @@ export function permissionOptions(toolCall, toolName, questionIndex = 0) {
     }
     const raw = toolCall;
     const input = toolRawInput(toolCall);
+    // MCP tool calls use the same six-row menu: the standard four rows plus
+    // deny-in-conversation and deny-in-settings. The persisted rule keys off
+    // the `server/tool` grant label, matching settings.json's mcp() entries.
+    if (toolName === "call_mcp_tool") {
+        const mcpServer = pickString(input, "ServerName", "serverName", "server_name");
+        const mcpTool = pickString(input, "ToolName", "toolName", "tool_name");
+        const grant = mcpServer && mcpTool
+            ? `${mcpServer}/${mcpTool}`
+            : (typeof raw.title === "string" && raw.title.trim() ? raw.title.trim() : "MCP tool");
+        return [
+            { optionId: "agy-allow-once", kind: "allow_once", name: "Yes" },
+            {
+                optionId: "agy-allow-conversation",
+                kind: "allow_always",
+                name: `Yes, and always allow '${grant}' in this conversation`
+            },
+            {
+                optionId: "agy-allow-settings",
+                kind: "allow_always",
+                name: `Yes, and always allow '${grant}' (Persist to settings.json)`
+            },
+            { optionId: "agy-reject-once", kind: "reject_once", name: "No" },
+            {
+                optionId: "agy-reject-conversation",
+                kind: "reject_always",
+                name: `No, and always deny '${grant}' in this conversation`
+            },
+            {
+                optionId: "agy-reject-settings",
+                kind: "reject_always",
+                name: `No, and always deny '${grant}' (Persist to settings.json)`
+            }
+        ];
+    }
     const command = pickString(input, "CommandLine", "commandLine", "command");
     const filePath = pickString(input, "TargetFile", "targetFile", "AbsolutePath", "absolutePath", "FilePath", "DirectoryPath", "directoryPath");
     const useCommandMenu = toolName === "run_command" ||
