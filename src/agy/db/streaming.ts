@@ -7,7 +7,7 @@ import { ConversationDb } from "./database.js";
 import type { GenMetadataUsage } from "./gen-metadata.js";
 import { newConversationId } from "./scan.js";
 import { isSystemMessage } from "./system-message.js";
-import { toolCallId } from "./tool-call-updates.js";
+import { parseRawInput, toolCallId } from "./tool-call-updates.js";
 import { Translator } from "./translator.js";
 import type { StepRow } from "./types.js";
 import { LIFECYCLE_STEP_TYPES } from "./updates.js";
@@ -24,6 +24,14 @@ export interface PendingInteraction {
    * happened.
    */
   blocked: boolean;
+}
+
+/** The newest non-terminal step when a turn stops making DB progress. */
+export interface StalledStep {
+  idx: number;
+  stepType: number;
+  status: number;
+  toolName: string | null;
 }
 
 export interface StreamOptions {
@@ -278,6 +286,21 @@ export class StreamPoller {
     if (!interaction) return false;
     this._pending.push(interaction);
     return true;
+  }
+
+  get hasRows(): boolean {
+    return this._hasRows;
+  }
+
+  /**
+   * What agy was still doing when DB progress stopped: the latest meaningful
+   * step if it never reached a terminal status (running tool, unanswered
+   * interaction, streaming text). Null when the latest step is terminal.
+   */
+  get stalledStep(): StalledStep | null {
+    const row = findLastMeaningfulStep(this._lastObservedRows ?? []);
+    if (!row || isTerminalStepStatus(row.status)) return null;
+    return { idx: row.idx, stepType: row.stepType, status: row.status, toolName: stalledToolName(row) };
   }
 
   get turnCompleteCandidate(): boolean {
@@ -536,6 +559,17 @@ function isIgnoredTurnStep(row: StepRow): boolean {
     if (isEmptyAgentTextStep(row)) return true;
   }
   return false;
+}
+
+/** Tool name only — never arguments, which can carry user data. */
+function stalledToolName(row: StepRow): string | null {
+  const call = row.stepPayload.toolRun?.call;
+  const name = call?.namePrimary || call?.nameSecondary || null;
+  if (name !== "call_mcp_tool") return name;
+  const input = parseRawInput(row) as { ServerName?: unknown; ToolName?: unknown } | null;
+  const server = typeof input?.ServerName === "string" ? input.ServerName : "";
+  const tool = typeof input?.ToolName === "string" ? input.ToolName : "";
+  return server && tool ? `${server}/${tool}` : tool || name;
 }
 
 function findLastMeaningfulStep(rows: StepRow[]): StepRow | undefined {

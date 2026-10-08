@@ -395,7 +395,7 @@ export class AgyCliSession {
                         await this.stopPty();
                         break;
                     }
-                    throw new AgyCliError(`agy interactive turn timed out after ${this.config.printTimeout}; no final turn completion was observed`, [this.config.agyPath], null, this.#ptyOutput);
+                    throw new AgyCliError(turnTimeoutMessage(this.config.printTimeout, poller), [this.config.agyPath], null, this.#ptyOutput);
                 }
                 for (const update of updates)
                     await this.raceTurnCallback(onUpdate(update), deadline);
@@ -1284,6 +1284,23 @@ function raceProcessError(promise, errorPromise, command) {
             throw errorForSpawnFailure(command, error);
         })
     ]);
+}
+/**
+ * Name what agy was stuck on when the turn deadline expired, so a client can
+ * tell a hung tool call from an unanswered interaction or a silent agy.
+ */
+function turnTimeoutMessage(printTimeout, poller) {
+    const base = `agy interactive turn timed out after ${printTimeout}; no final turn completion was observed`;
+    const stalled = poller.stalledStep;
+    if (!stalled)
+        return poller.hasRows ? base : `${base}; agy recorded no steps for this turn`;
+    if (stalled.status === 9) {
+        return `${base}; step ${stalled.idx} is still blocked on a '${stalled.toolName ?? "unknown"}' interaction`;
+    }
+    if (stalled.toolName) {
+        return `${base}; tool '${stalled.toolName}' (step ${stalled.idx}) was still running with no progress`;
+    }
+    return `${base}; step ${stalled.idx} (type ${stalled.stepType}, status ${stalled.status}) was still in progress with no progress`;
 }
 function errorForSpawnFailure(command, error) {
     const executable = command[0];

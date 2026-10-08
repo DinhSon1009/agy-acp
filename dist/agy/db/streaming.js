@@ -4,7 +4,7 @@
 import { ConversationDb } from "./database.js";
 import { newConversationId } from "./scan.js";
 import { isSystemMessage } from "./system-message.js";
-import { toolCallId } from "./tool-call-updates.js";
+import { parseRawInput, toolCallId } from "./tool-call-updates.js";
 import { Translator } from "./translator.js";
 import { LIFECYCLE_STEP_TYPES } from "./updates.js";
 function isContentSafetyRefusal(pe) {
@@ -210,6 +210,20 @@ export class StreamPoller {
             return false;
         this._pending.push(interaction);
         return true;
+    }
+    get hasRows() {
+        return this._hasRows;
+    }
+    /**
+     * What agy was still doing when DB progress stopped: the latest meaningful
+     * step if it never reached a terminal status (running tool, unanswered
+     * interaction, streaming text). Null when the latest step is terminal.
+     */
+    get stalledStep() {
+        const row = findLastMeaningfulStep(this._lastObservedRows ?? []);
+        if (!row || isTerminalStepStatus(row.status))
+            return null;
+        return { idx: row.idx, stepType: row.stepType, status: row.status, toolName: stalledToolName(row) };
     }
     get turnCompleteCandidate() {
         return this._hasRows && !this._busy && this._latestStepTerminal;
@@ -470,6 +484,17 @@ function isIgnoredTurnStep(row) {
             return true;
     }
     return false;
+}
+/** Tool name only — never arguments, which can carry user data. */
+function stalledToolName(row) {
+    const call = row.stepPayload.toolRun?.call;
+    const name = call?.namePrimary || call?.nameSecondary || null;
+    if (name !== "call_mcp_tool")
+        return name;
+    const input = parseRawInput(row);
+    const server = typeof input?.ServerName === "string" ? input.ServerName : "";
+    const tool = typeof input?.ToolName === "string" ? input.ToolName : "";
+    return server && tool ? `${server}/${tool}` : tool || name;
 }
 function findLastMeaningfulStep(rows) {
     for (let i = rows.length - 1; i >= 0; i--) {

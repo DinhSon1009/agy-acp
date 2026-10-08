@@ -2322,8 +2322,47 @@ describe("permission bridge", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-acp-pty-"));
     const pty = new FakePty();
     const session = interactiveSession(dir, pty, "30ms");
-    await expect(session.prompt("go", async () => {}, async () => "cancelled")).rejects.toThrow(/timed out after 30ms/);
+    await expect(session.prompt("go", async () => {}, async () => "cancelled")).rejects.toThrow(/timed out after 30ms; no final turn completion was observed; agy recorded no steps for this turn/);
     expect(pty.killed).toBe(true);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("names the hung MCP tool when the turn deadline expires mid tool call", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-acp-pty-hung-tool-"));
+    const pty = new FakePty(() => {
+      const db = createConversationDb(dir, "hung-tool");
+      insertStep(db, { idx: 1, stepType: 14, status: 3, stepPayload: encodeStepPayload({ userPrompt: "go" }) });
+      insertStep(db, { idx: 2, stepType: 132, status: 2, stepPayload: encodeStepPayload({
+        toolRun: encodeToolRun({ call: encodeToolCall({
+          callId: "call-hung",
+          namePrimary: "call_mcp_tool",
+          rawInputJson: '{"Arguments":{"url":"https://example.test/secret-path"},"ServerName":"chrome-devtools","ToolName":"navigate_page"}'
+        }) })
+      }) });
+      db.close();
+    });
+    const session = interactiveSession(dir, pty, "250ms");
+    const error = await session.prompt("go", async () => {}, async () => "agy-allow-once").catch((e: Error) => e);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(/timed out after 250ms; no final turn completion was observed; tool 'chrome-devtools\/navigate_page' \(step 2\) was still running/);
+    expect((error as Error).message).not.toContain("secret-path");
+    expect(pty.killed).toBe(true);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("reports a still-blocked interaction when agy stays gated after the client answered", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-acp-pty-pending-gate-"));
+    const pty = new FakePty(() => {
+      const db = createConversationDb(dir, "pending-gate");
+      insertStep(db, pendingToolRow("run_command"));
+      db.close();
+    });
+    pty.emitPermissionPanelOnStart = false;
+    pty.emitArrowRedraw = false;
+    const session = interactiveSession(dir, pty, "250ms");
+    await expect(session.prompt("go", async () => {}, async () => "agy-allow-once")).rejects.toThrow(
+      /step 1 is still blocked on a 'run_command' interaction/
+    );
     fs.rmSync(dir, { recursive: true, force: true });
   });
 });

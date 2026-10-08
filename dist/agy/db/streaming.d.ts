@@ -14,6 +14,13 @@ export interface PendingInteraction {
      */
     blocked: boolean;
 }
+/** The newest non-terminal step when a turn stops making DB progress. */
+export interface StalledStep {
+    idx: number;
+    stepType: number;
+    status: number;
+    toolName: string | null;
+}
 export interface StreamOptions {
     dir: string;
     /** Bound conversation id, or null to bind the DB agy creates for a fresh prompt. */
@@ -92,6 +99,13 @@ export declare class StreamPoller {
     takePending(): PendingInteraction[];
     /** Requeue a still-blocked interaction when the TUI redraws an identical gate. */
     requeuePending(id: string): boolean;
+    get hasRows(): boolean;
+    /**
+     * What agy was still doing when DB progress stopped: the latest meaningful
+     * step if it never reached a terminal status (running tool, unanswered
+     * interaction, streaming text). Null when the latest step is terminal.
+     */
+    get stalledStep(): StalledStep | null;
     get turnCompleteCandidate(): boolean;
     /**
      * True when the latest terminal step is a safe single-idle-marker completion.
