@@ -1,0 +1,1281 @@
+import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { chmodSync, existsSync, statSync } from "node:fs";
+import * as os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { readLatestSessionUsage } from "./db/database.js";
+import { conversationSnapshot } from "./db/scan.js";
+import { defaultInstallBinDir, ensureAgyInstalled } from "./installer.js";
+import { StreamPoller } from "./db/streaming.js";
+import { diffBlocks, revertEditToolCall } from "./edit/revert.js";
+import { primeEditReadThroughClient, routeEditThroughClient, writeEditThroughClient } from "./edit/bridge.js";
+import { buildReconcileEditUpdate, observeEditedPaths, reconcileWorkingTree, snapshotWorkingTree, toDisplayPath } from "./edit/reconcile.js";
+import { canBridgeInteraction, interactionKeys, isEditToolCall, normalizePermissionChoice, parseAskQuestion } from "../acp/tool-calls/permissions.js";
+export const DEFAULT_AGY_MODEL_LIST_TIMEOUT_MS = 15_000;
+export const DEFAULT_CONVERSATIONS_DIR = path.join(os.homedir(), ".gemini", "antigravity-cli", "conversations");
+const POLL_INTERVAL_MS = 200;
+/** Trailing polls after the process exits, to catch rows flushed right around exit. */
+const TRAILING_POLL_ATTEMPTS = 3;
+const TRAILING_POLL_DELAY_MS = 100;
+const PERMISSION_RENDER_SETTLE_MS = 20;
+const PERMISSION_KEY_DELAY_MS = 50;
+const QUIESCENT_SETTLE_MS = 300;
+/**
+ * agy's input footer is the ground truth for "turn over": it is drawn only
+ * when the TUI returns to a free prompt. DB step state alone cannot tell a
+ * completed narration row (stepType 15 lands before every tool call) from the
+ * final answer — the next step reaches SQLite only after the following
+ * generation finishes, so any quiescence window races model latency.
+ */
+const TURN_IDLE_MARKER = "? for shortcuts";
+/** Signature of the permission decision agy has recorded for a gated step.
+ *  A re-armed status-9 prompt (e.g. the next segment of `a && b`) changes this
+ *  even though the toolCallId is unchanged, letting the turn loop tell a fresh
+ *  decision apart from a redundant re-emission of the same still-pending one. */
+function permissionSignature(row) {
+    const p = row.permission;
+    return p ? `${p.kind}\u0000${p.value}\u0000${p.decision}` : "none";
+}
+/**
+ * agy tools whose diff blocks carry the whole file body rather than a snippet,
+ * so disk is accounted for exactly when it equals the reported content. An
+ * unrecognized name is treated as a targeted replacement, which fails closed.
+ */
+const WHOLE_FILE_EDIT_TOOLS = new Set(["write_to_file"]);
+/** True when the tool-call's diff blocks carry whole file bodies, not snippets. */
+function wholeFileEdit(toolCall) {
+    const name = toolCall.name;
+    return name !== undefined && WHOLE_FILE_EDIT_TOOLS.has(name);
+}
+/**
+ * What a tool-call's diff reported, per absolute path (targets may be
+ * session-relative). The blocks let the reconciler tell the change this update
+ * accounts for apart from one that reached the file before it was polled.
+ */
+function reportedContents(cwd, toolCall) {
+    const wholeFile = wholeFileEdit(toolCall);
+    const byPath = new Map();
+    for (const { path: target, oldText, newText } of diffBlocks(toolCall)) {
+        const abs = path.resolve(cwd, target);
+        const blocks = byPath.get(abs);
+        if (blocks)
+            blocks.push({ oldText, newText });
+        else
+            byPath.set(abs, [{ oldText, newText }]);
+    }
+    return [...byPath].map(([filePath, blocks]) => ({ path: filePath, blocks, wholeFile }));
+}
+/**
+ * What a completed revert restored, per absolute path. A rejected creation
+ * left nothing on disk and the client rejected it, so the path is forgotten
+ * unconditionally. Anything else is attributed by the *reverse* of the
+ * restored blocks: the client knows the edit was undone, but a restored block
+ * says nothing about the rest of the file, so an unrelated change that landed
+ * next to the edit before the reject still reaches reconciliation.
+ */
+function revertedContents(cwd, toolCall, restored) {
+    const wholeFile = wholeFileEdit(toolCall);
+    const byPath = new Map();
+    for (const { path: target, oldText, newText } of restored) {
+        const abs = path.resolve(cwd, target);
+        const entry = byPath.get(abs) ?? { created: false, blocks: [] };
+        if (oldText === null)
+            entry.created = true;
+        else
+            entry.blocks.push({ oldText: newText, newText: oldText });
+        byPath.set(abs, entry);
+    }
+    return [...byPath].map(([filePath, { created, blocks }]) => created ? { path: filePath } : { path: filePath, wholeFile, blocks });
+}
+/** How many unsupported changes to name individually in the warning line. */
+const UNSUPPORTED_DETAIL_LIMIT = 10;
+export const SESSION_MODE_IDS = [
+    "default",
+    "accept-edits",
+    "plan"
+];
+export function isSessionModeId(value) {
+    return SESSION_MODE_IDS.includes(value);
+}
+export class AgyCliError extends Error {
+    command;
+    exitCode;
+    stderr;
+    constructor(message, command, exitCode, stderr) {
+        super(message);
+        this.name = "AgyCliError";
+        this.command = command;
+        this.exitCode = exitCode;
+        this.stderr = stderr;
+    }
+}
+export class AgyCliSession {
+    #process;
+    #pty;
+    #ptyExit;
+    #ptyOutput = "";
+    #ptyPermissionMarkerCount = 0;
+    #ptyPermissionRender = "";
+    #ptyPermissionMarkerTail = "";
+    #ptyIdleMarkerAt = 0;
+    #ptyIdleMarkerTail = "";
+    #ptyPermissionRenderTimer;
+    #activeStreamPoller;
+    #ptyConfig = "";
+    #cancelled = false;
+    #cancelTurn;
+    #cancelWait = Promise.resolve();
+    #extraPath;
+    #conversationId = null;
+    #lastStepIdx = -1;
+    #lastGenMetadataIdx = -1;
+    #lastPromptUserStepIdxs = [];
+    config;
+    spawnProcess;
+    ptyFactory;
+    constructor(config, spawnProcess = defaultSpawnFactory, ptyFactory) {
+        this.config = config;
+        this.spawnProcess = spawnProcess;
+        this.ptyFactory = ptyFactory;
+    }
+    get wasCancelled() {
+        return this.#cancelled;
+    }
+    /** The agy conversation id this session is bound to, once known (after the first prompt). */
+    get conversationId() {
+        return this.#conversationId;
+    }
+    /** Highest conversation-database step idx already delivered to the ACP client. */
+    get lastStepIdx() {
+        return this.#lastStepIdx;
+    }
+    /** Type-14 user rows observed during the most recent prompt invocation. */
+    get lastPromptUserStepIdxs() {
+        return this.#lastPromptUserStepIdxs;
+    }
+    /** Highest gen_metadata idx seen in this session. */
+    get lastGenMetadataIdx() {
+        return this.#lastGenMetadataIdx;
+    }
+    /** Seed the conversation binding from persisted state (for session/load and session/resume). */
+    restoreConversation(conversationId, lastStepIdx, lastGenMetadataIdx) {
+        this.#conversationId = conversationId;
+        this.#lastStepIdx = lastStepIdx;
+        if (lastGenMetadataIdx !== undefined && lastGenMetadataIdx >= 0) {
+            this.#lastGenMetadataIdx = lastGenMetadataIdx;
+        }
+        else if (conversationId) {
+            const latestGen = readLatestSessionUsage(this.config.conversationsDir, conversationId);
+            this.#lastGenMetadataIdx = latestGen ? latestGen.idx : -1;
+        }
+        else {
+            this.#lastGenMetadataIdx = -1;
+        }
+    }
+    setModel(model) {
+        this.config.model = model;
+    }
+    setEffort(effort) {
+        this.config.effort = effort;
+    }
+    setMode(mode) {
+        this.config.mode = mode;
+    }
+    commandForPrompt(prompt) {
+        const command = [
+            this.config.agyPath,
+            "--print"
+        ];
+        if (this.config.promptInArgv) {
+            command.push(prompt);
+        }
+        command.push("--print-timeout", this.config.printTimeout);
+        if (this.config.sandbox) {
+            command.push("--sandbox");
+        }
+        if (this.config.skipPermissions) {
+            command.push("--dangerously-skip-permissions");
+        }
+        if (this.config.mode !== "default") {
+            command.push("--mode", this.config.mode);
+        }
+        if (this.config.model) {
+            command.push("--model", this.config.model);
+        }
+        if (this.config.effort) {
+            command.push("--effort", this.config.effort);
+        }
+        if (this.config.project) {
+            command.push("--project", this.config.project);
+        }
+        if (this.config.logFile) {
+            command.push("--log-file", this.config.logFile);
+        }
+        if (this.#conversationId) {
+            command.push("--conversation", this.#conversationId);
+        }
+        // Pass cwd + additionalDirectories as --add-dir roots (cwd included so agy
+        // treats the workspace the same way the previous workspaces[] list did).
+        const seen = new Set();
+        for (const root of [this.config.cwd, ...this.config.additionalDirectories]) {
+            const resolved = path.resolve(root);
+            if (seen.has(resolved)) {
+                continue;
+            }
+            seen.add(resolved);
+            command.push("--add-dir", resolved);
+        }
+        return command;
+    }
+    interactiveCommandForPrompt(prompt) {
+        const command = this.commandForPrompt(prompt);
+        const timeout = command.indexOf("--print-timeout");
+        if (timeout >= 0)
+            command.splice(timeout, 2);
+        const print = command.indexOf("--print");
+        if (print >= 0)
+            command.splice(print, this.config.promptInArgv ? 2 : 1);
+        command.splice(1, 0, "--prompt-interactive", prompt);
+        return command;
+    }
+    /**
+     * Run one prompt turn: spawn agy, poll its conversation database for newly
+     * appended steps while the process runs, and invoke `onUpdate` with the
+     * translated ACP updates in order. Resolves once the process exits and a few
+     * trailing polls have drained any steps flushed right around exit.
+     *
+     * Invariant (zero prompt injection): `prompt` is only client-originated
+     * content from ACP session/prompt. Never invent labels, instructions, or
+     * follow-ups (e.g. "continue") — for background wakeups, keep the turn open
+     * and poll instead. PTY writes during a turn are permission keys (or the same
+     * user `prompt` when reusing an interactive TUI), never adapter prose.
+     */
+    async prompt(prompt, onUpdate, onPermission, fsBridge, elicitationCap) {
+        this.#lastPromptUserStepIdxs = [];
+        if (this.config.interactivePermissions && !onPermission) {
+            throw new Error("interactive permissions require a permission callback");
+        }
+        this.#cancelled = false;
+        this.#cancelWait = new Promise((resolve) => { this.#cancelTurn = resolve; });
+        try {
+            if (this.config.interactivePermissions) {
+                return await this.runInteractivePrompt(prompt, onUpdate, onPermission, fsBridge, elicitationCap);
+            }
+            const command = this.commandForPrompt(prompt);
+            try {
+                return await this.runPromptCommand(command, prompt, onUpdate, fsBridge);
+            }
+            catch (error) {
+                if (this.shouldInstallAfterError(error)) {
+                    await this.installAgy();
+                    return await this.runPromptCommand(this.commandForPrompt(prompt), prompt, onUpdate, fsBridge);
+                }
+                throw error;
+            }
+        }
+        finally {
+            this.#cancelTurn = undefined;
+        }
+    }
+    async runInteractivePrompt(prompt, onUpdate, onPermission, fsBridge, elicitationCap) {
+        // Snapshot the pre-edit working tree so edits agy makes outside recognized
+        // structured-edit tool-calls (shell commands, unrecognized payloads) still
+        // get reflected through ACP. Emitting the synthetic session/update needs no
+        // client fs capability, so do this for every client (v1 and v2); the client
+        // write-through is layered on later only when a bridge is available.
+        let editBaseline = null;
+        try {
+            editBaseline = await snapshotWorkingTree([this.config.cwd, ...this.config.additionalDirectories]);
+        }
+        catch {
+            editBaseline = null;
+        }
+        const observeReported = (reported) => this.observeReported(editBaseline, reported);
+        const signature = JSON.stringify([this.config.model, this.config.effort, this.config.mode]);
+        if (this.#pty && this.#ptyConfig !== signature)
+            await this.stopPty();
+        if (this.#cancelled) {
+            this.#cancelTurn = undefined;
+            return { stopReason: "cancelled" };
+        }
+        const snapshot = this.#conversationId === null ? conversationSnapshot(this.config.conversationsDir) : null;
+        const factory = this.#pty ? undefined : (this.ptyFactory ?? await defaultPtyFactory());
+        if (!this.#pty && this.#cancelled) {
+            this.#cancelTurn = undefined;
+            return { stopReason: "cancelled" };
+        }
+        const poller = new StreamPoller({ dir: this.config.conversationsDir, conversationId: this.#conversationId,
+            baseStepIdx: this.#lastStepIdx, baseGenMetadataIdx: this.#lastGenMetadataIdx, skipNarration: false, cwd: this.config.cwd, snapshot });
+        this.#activeStreamPoller = poller;
+        if (!this.#pty) {
+            const [program, ...args] = this.interactiveCommandForPrompt(prompt);
+            this.#pty = factory.spawn(program, args, { ...this.spawnOptions(), cols: 120, rows: 40 });
+            this.#ptyConfig = signature;
+            this.#ptyOutput = "";
+            this.#ptyPermissionMarkerCount = 0;
+            this.#ptyPermissionRender = "";
+            this.#ptyPermissionMarkerTail = "";
+            this.#ptyIdleMarkerAt = 0;
+            this.#ptyIdleMarkerTail = "";
+            const activePty = this.#pty;
+            activePty.onData((data) => {
+                if (this.#pty !== activePty)
+                    return;
+                // Keep these locals namespaced: host integrations inject their own
+                // idleData/idleClean scan at the #ptyPermissionRender anchor below.
+                const { completed: turnIdleData, incomplete: turnIdleIncomplete } = splitIncompleteAnsi(this.#ptyIdleMarkerTail + data);
+                const turnIdleClean = turnIdleData.replace(/\x1b\[[0-9;?]*[a-zA-Z]|\x1b\].*?\x07|\x1b[()][AB012]/g, "");
+                if (turnIdleClean.includes(TURN_IDLE_MARKER))
+                    this.#ptyIdleMarkerAt = Date.now();
+                this.#ptyIdleMarkerTail = markerPrefixTail(turnIdleClean, TURN_IDLE_MARKER) + turnIdleIncomplete;
+                this.#ptyPermissionRender = (this.#ptyPermissionRender + data).slice(-16_384);
+                if (this.#ptyPermissionRenderTimer)
+                    clearTimeout(this.#ptyPermissionRenderTimer);
+                this.#ptyPermissionRenderTimer = setTimeout(() => this.flushPermissionRender(), PERMISSION_RENDER_SETTLE_MS);
+                this.#ptyOutput = (this.#ptyOutput + data).slice(-16_384);
+            });
+            this.#ptyExit = new Promise((resolve) => this.#pty.onExit(resolve));
+        }
+        else {
+            this.#pty.write(`\x1b[200~${prompt.replaceAll("\x1b", "")}\x1b[201~\r`);
+        }
+        // Tracked separately: a toolCallId can legitimately go through the live
+        // gate first (status 9 -> keys sent) and later reappear as a completed
+        // edit once agy applies it, at which point it's still worth routing
+        // through the client's fs write-through so its native review UI tracks
+        // the edit — that's a second, independent decision for the same id.
+        const requestedGate = new Map();
+        const gateMarkerCounts = new Map();
+        const rearmedGateIds = new Set();
+        const requestedEditReview = new Set();
+        // ids that already went through the live gate above, so a later
+        // completed-edit sighting shouldn't trigger a second (redundant) local
+        // permission prompt if the client has no fs write-through.
+        const gatedIds = new Set();
+        const activePtyExit = this.#ptyExit;
+        const timeoutMs = parsePrintTimeoutMs(this.config.printTimeout);
+        let deadline = Date.now() + timeoutMs;
+        let candidateRevision = -1;
+        // Only a footer repaint after the DB last looked unfinished proves agy
+        // returned to its prompt: repaints mid-turn land on busy observations and
+        // keep moving this boundary forward, so they can never satisfy the gate
+        // for a later turn-complete candidate.
+        let busyBoundaryAt = Date.now();
+        let seenRevision = -1;
+        let lastActivityTime = Date.now();
+        let failed = false;
+        try {
+            while (true) {
+                if (this.#cancelled)
+                    break;
+                const updates = poller.poll();
+                if (poller.revision !== seenRevision) {
+                    seenRevision = poller.revision;
+                    candidateRevision = poller.turnCompleteCandidate ? poller.revision : -1;
+                    deadline = Date.now() + timeoutMs;
+                    lastActivityTime = Date.now();
+                }
+                if (!poller.turnCompleteCandidate) {
+                    candidateRevision = -1;
+                    busyBoundaryAt = Date.now();
+                }
+                if (updates.length > 0) {
+                    lastActivityTime = Date.now();
+                }
+                if (Date.now() >= deadline) {
+                    if (poller.turnCompleteCandidate && poller.lastStepIdx > this.#lastStepIdx) {
+                        await this.stopPty();
+                        break;
+                    }
+                    throw new AgyCliError(`agy interactive turn timed out after ${this.config.printTimeout}; no final turn completion was observed`, [this.config.agyPath], null, this.#ptyOutput);
+                }
+                for (const update of updates)
+                    await this.raceTurnCallback(onUpdate(update), deadline);
+                if (updates.length > 0) {
+                    lastActivityTime = Date.now();
+                }
+                if (this.#cancelled)
+                    break;
+                for (const [id, markerCount] of gateMarkerCounts) {
+                    if (this.#ptyPermissionMarkerCount <= markerCount)
+                        continue;
+                    // An identical permission gate can redraw without changing the DB at
+                    // all. Use the permission-panel-specific redraw as its occurrence
+                    // signal; a normal progress or completion redraw must not requeue it.
+                    if (poller.requeuePending(id))
+                        rearmedGateIds.add(id);
+                    gateMarkerCounts.delete(id);
+                }
+                let hadInteraction = false;
+                for (const interaction of poller.takePending()) {
+                    hadInteraction = true;
+                    const toolCall = interaction.update;
+                    const id = String(toolCall.toolCallId);
+                    if (interaction.blocked) {
+                        // A single agy run_command step can gate several sequential
+                        // decisions (each segment of `a && b`, a sandbox escalation, ...):
+                        // agy records the just-resolved decision in the row's permission
+                        // column but keeps the step at status 9 until every decision is
+                        // answered. Content dedup handles ordinary DB updates; a
+                        // permission-panel redraw explicitly re-arms an identical gate.
+                        const signature = permissionSignature(interaction.row);
+                        const rearmed = rearmedGateIds.delete(id);
+                        if (!rearmed && requestedGate.get(id) === signature)
+                            continue;
+                        requestedGate.set(id, signature);
+                    }
+                    else {
+                        if (requestedEditReview.has(id))
+                            continue;
+                        requestedEditReview.add(id);
+                    }
+                    if (interaction.blocked) {
+                        const hasElicitation = Boolean(elicitationCap?.form);
+                        if (!canBridgeInteraction(interaction.toolName, toolCall, { hasElicitation })) {
+                            const detail = unsupportedInteractionDetail(interaction.toolName, toolCall, { hasElicitation });
+                            throw new AgyCliError(`Unsupported agy interaction '${interaction.toolName}' (status 9); ${detail}`, [this.config.agyPath], null, this.#ptyOutput);
+                        }
+                        gatedIds.add(id);
+                        if (fsBridge && isEditToolCall(toolCall)) {
+                            // Prime the client's pre-edit snapshot now, while disk still
+                            // genuinely holds it — agy hasn't written yet. Doing this
+                            // after the fact (like the ungated path below) would mean
+                            // reverting disk ourselves and racing the client's own file
+                            // watcher/open-buffer state, which can silently produce an
+                            // empty diff if the file is open in the client's editor.
+                            try {
+                                await this.raceTurnCallback(primeEditReadThroughClient(toolCall, fsBridge), deadline);
+                            }
+                            catch {
+                                // best effort
+                            }
+                        }
+                        if (interaction.toolName === "ask_question") {
+                            const ask = parseAskQuestion(toolCall);
+                            const count = ask?.questions.length ?? 1;
+                            for (let qIndex = 0; qIndex < count; qIndex++) {
+                                const choice = await this.raceTurnCallback(onPermission(toolCall, { toolName: interaction.toolName, questionIndex: qIndex }));
+                                deadline = Date.now() + timeoutMs;
+                                if (this.#cancelled || choice === "cancelled") {
+                                    this.#cancelled = true;
+                                    break;
+                                }
+                                const keys = interactionKeys(choice, interaction.toolName, toolCall, qIndex);
+                                if (keys == null) {
+                                    throw new AgyCliError(`Unsupported permission choice '${choice}' for '${interaction.toolName}'`, [this.config.agyPath], null, this.#ptyOutput);
+                                }
+                                this.#pty?.write(keys);
+                                if (choice === "agy-q-skip" || choice.endsWith("-skip"))
+                                    break;
+                                if (qIndex < count - 1) {
+                                    await sleep(50);
+                                }
+                            }
+                        }
+                        else {
+                            const choice = await this.raceTurnCallback(onPermission(toolCall, { toolName: interaction.toolName }));
+                            deadline = Date.now() + timeoutMs;
+                            if (this.#cancelled || choice === "cancelled") {
+                                this.#cancelled = true;
+                                break;
+                            }
+                            const keys = interactionKeys(choice, interaction.toolName, toolCall);
+                            if (keys == null) {
+                                throw new AgyCliError(`Unsupported permission choice '${choice}' for '${interaction.toolName}'`, [this.config.agyPath], null, this.#ptyOutput);
+                            }
+                            if (!await this.writePermissionKeys(keys))
+                                break;
+                        }
+                        gateMarkerCounts.set(id, this.#ptyPermissionMarkerCount);
+                        continue;
+                    }
+                    // Completed edit — either it landed on disk without ever pausing
+                    // (accept-edits / skip-permissions), or it just passed through the
+                    // live gate above and agy applied it. Either way, if the client can
+                    // take the write itself, hand it off so its native diff/review UI
+                    // (e.g. Zed's Review Changes panel) tracks it.
+                    //
+                    // Record what disk holds for the reported paths before any
+                    // write-through revert/replay, so reconciliation cannot mistake the
+                    // client's own write (or the intermediate revert) for an unreflected
+                    // change. Paths whose content this update no longer accounts for are
+                    // left for reconciliation to report.
+                    await observeReported(reportedContents(this.config.cwd, toolCall));
+                    let restored = [];
+                    try {
+                        if (fsBridge) {
+                            const routed = gatedIds.has(id)
+                                // Pre-edit state was already primed above (race-free) — just
+                                // hand over the final content, no local revert needed.
+                                ? await this.raceTurnCallback(writeEditThroughClient(toolCall, fsBridge), deadline)
+                                // No prior gate — this is the only chance we get, so fall back
+                                // to revert-then-replay (races the client's file watcher if
+                                // the file happens to be open there, but it's the best we can
+                                // do after the fact).
+                                : await this.raceTurnCallback(routeEditThroughClient(toolCall, fsBridge), deadline);
+                            if (routed === true)
+                                continue;
+                        }
+                        if (gatedIds.has(id)) {
+                            // Already approved through the live gate above and the client
+                            // has no write-through — nothing more to do here.
+                            continue;
+                        }
+                        // Genuinely ungated (no live agy gate ever asked) and no client
+                        // write-through available — offer local review: keep is a no-op,
+                        // reject restores prior text.
+                        const choice = await this.raceTurnCallback(onPermission(toolCall, { toolName: interaction.toolName }));
+                        deadline = Date.now() + timeoutMs;
+                        if (this.#cancelled || choice === "cancelled") {
+                            this.#cancelled = true;
+                            break;
+                        }
+                        if (normalizePermissionChoice(choice) === "agy-reject-once") {
+                            restored = revertEditToolCall(toolCall);
+                        }
+                    }
+                    finally {
+                        // A reject put the pre-edit text back on disk; that restoration is
+                        // the answer the client already has, so re-record it rather than
+                        // reporting it again as an unstructured change. Only the blocks
+                        // the revert actually restored, and only through the reverse
+                        // attribution: a diverged block it declined to touch, or an
+                        // unrelated change next to the edit, still holds content the
+                        // client has not seen.
+                        if (restored.length > 0) {
+                            await observeReported(revertedContents(this.config.cwd, toolCall, restored));
+                        }
+                    }
+                }
+                if (hadInteraction) {
+                    lastActivityTime = Date.now();
+                }
+                const hasQuiesced = (Date.now() - lastActivityTime) >= QUIESCENT_SETTLE_MS;
+                // DB state says the turn *looks* done — but a completed narration row
+                // is indistinguishable from the final answer while agy is still
+                // generating the next step. Only a TUI footer repaint since the DB
+                // last looked unfinished proves the prompt is really back; a missed
+                // redraw still resolves through the printTimeout deadline path
+                // instead of hanging forever.
+                const sawIdleMarker = this.#ptyIdleMarkerAt >= busyBoundaryAt;
+                const isIdleCandidate = poller.turnCompleteCandidate &&
+                    poller.lastStepIdx > this.#lastStepIdx &&
+                    candidateRevision === poller.revision &&
+                    hasQuiesced &&
+                    sawIdleMarker &&
+                    (poller.isConclusiveTurnEnd || poller.isSuccessfulToolOnlyEnd);
+                if (isIdleCandidate) {
+                    // Background work can finish after the TUI looks idle. Stay on this
+                    // user turn and keep polling — do not inject a synthetic "continue".
+                    // Do not re-arm deadline here: only poller revision progress (above)
+                    // refreshes the timeout, so a missing completion cannot hang forever.
+                    if ((poller.hasActiveBackgroundTasks || !poller.turnCompleteCandidate) && !this.#cancelled) {
+                        const exited = await Promise.race([activePtyExit.then(() => true), sleep(POLL_INTERVAL_MS).then(() => false)]);
+                        if (exited && !this.#cancelled)
+                            throw new AgyCliError(`agy interactive PTY exited unexpectedly: ${this.#ptyOutput.trim() || "<no output>"}`, [this.config.agyPath], null, this.#ptyOutput);
+                        continue;
+                    }
+                    break;
+                }
+                const exited = await Promise.race([activePtyExit.then(() => true), sleep(POLL_INTERVAL_MS).then(() => false)]);
+                if (exited && !this.#cancelled)
+                    throw new AgyCliError(`agy interactive PTY exited unexpectedly: ${this.#ptyOutput.trim() || "<no output>"}`, [this.config.agyPath], null, this.#ptyOutput);
+            }
+            if (editBaseline && !this.#cancelled) {
+                // The final idle marker has already proved that agy completed. Do not
+                // reuse its inactivity deadline for client notification/write-through.
+                await this.reflectUnstructuredEdits(editBaseline, fsBridge, onUpdate);
+            }
+            const detectedStopReason = poller.detectStopReason();
+            const stopReason = this.#cancelled ? "cancelled" : detectedStopReason;
+            const usage = poller.accumulatedTurnUsage();
+            return { stopReason, usage };
+        }
+        catch (error) {
+            failed = true;
+            await this.stopPty();
+            throw error;
+        }
+        finally {
+            this.#conversationId = poller.conversationId ?? this.#conversationId;
+            this.#lastStepIdx = Math.max(this.#lastStepIdx, poller.lastStepIdx);
+            this.#lastGenMetadataIdx = Math.max(this.#lastGenMetadataIdx, poller.lastGenMetadataIdx);
+            this.#lastPromptUserStepIdxs = poller.userStepIdxs;
+            poller.close();
+            if (this.#activeStreamPoller === poller)
+                this.#activeStreamPoller = undefined;
+            if (this.#cancelled && !failed)
+                await this.stopPty();
+        }
+    }
+    async raceTurnCallback(callback, deadline) {
+        const guarded = callback.catch((error) => {
+            if (this.#cancelled)
+                return "cancelled";
+            throw error;
+        });
+        if (deadline === undefined) {
+            return await Promise.race([guarded, this.#cancelWait.then(() => "cancelled")]);
+        }
+        let timer;
+        const timedOut = new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new AgyCliError(`agy interactive turn timed out after ${this.config.printTimeout}; no final idle marker was observed`, [this.config.agyPath], null, this.#ptyOutput)), Math.max(0, deadline - Date.now()));
+        });
+        try {
+            return await Promise.race([guarded, this.#cancelWait.then(() => "cancelled"), timedOut]);
+        }
+        finally {
+            if (timer)
+                clearTimeout(timer);
+        }
+    }
+    /**
+     * Record the on-disk content of the paths a reported edit covers, so
+     * end-of-turn reconciliation only emits changes the client has *not* been
+     * told about. Best effort: a snapshot we fail to refresh at worst re-reports
+     * a change the client already has, which is preferable to failing the turn.
+     * (See {@link ReportedContent} for how divergence is handled.)
+     */
+    async observeReported(baseline, reported) {
+        if (!baseline)
+            return;
+        try {
+            await observeEditedPaths(baseline, reported);
+        }
+        catch (error) {
+            console.error(`[agy-acp] WARN: could not record reported edit state: ${error.message}`);
+        }
+    }
+    /**
+     * After a turn, diff the working tree against what the client has been told
+     * (see {@link observeReportedEdit}) and reflect any change agy made that
+     * never surfaced as a recognized structured edit (shell edits, unrecognized
+     * payloads) through ACP: emit a synthetic edit update for every client, and
+     * additionally hand the write to the client when it advertises fs
+     * capabilities. Discovery failures are best-effort (logged); notification
+     * failures propagate so the caller does not go idle after a dropped update.
+     * Changes that can't be shown as a text diff (binary/oversized/deletions,
+     * files whose pre-turn content was never captured) are reported, not
+     * dropped (#76).
+     */
+    async reflectUnstructuredEdits(baseline, fsBridge, onUpdate) {
+        let reflected;
+        let unsupported;
+        try {
+            ({ reflected, unsupported } = await reconcileWorkingTree(baseline));
+        }
+        catch (error) {
+            // Filesystem scan is best-effort — a transient stat failure shouldn't
+            // fail the whole turn after agy already finished.
+            console.error(`[agy-acp] WARN: working-tree reconciliation failed: ${error.message}`);
+            return;
+        }
+        // UUID (not a session-local counter): session/load and session/resume rebuild
+        // AgyCliSession via startSession, which would reset a counter and reuse IDs.
+        const turnToken = randomUUID();
+        let index = 0;
+        for (const edit of reflected) {
+            if (this.#cancelled)
+                return;
+            const update = buildReconcileEditUpdate(edit, index++, this.config.cwd, turnToken);
+            // Propagate onUpdate / write-through failures: the ordinary update loop
+            // does not swallow them, and going idle after a dropped edit update
+            // would leave the client inconsistent with disk.
+            const delivered = await this.raceTurnCallback(onUpdate(update));
+            if (delivered === "cancelled")
+                return;
+            if (fsBridge) {
+                // routeEditThroughClient swallows RPC errors and returns false — treat
+                // that as a hard failure here so we do not report end_turn after a
+                // promised client handoff that never completed. Once routing starts it
+                // must finish even if cancellation arrives, because it temporarily
+                // restores pre-edit text on disk while the client snapshots it.
+                const routed = await routeEditThroughClient(update, fsBridge);
+                if (routed !== true) {
+                    throw new Error(`client filesystem write-through failed for reconciled edit ${toDisplayPath(edit.path, this.config.cwd)}`);
+                }
+            }
+        }
+        if (unsupported.length > 0) {
+            // One removed ignore rule can expose a whole directory; name a bounded
+            // sample instead of a line with thousands of paths on it.
+            const named = unsupported
+                .slice(0, UNSUPPORTED_DETAIL_LIMIT)
+                .map((change) => `${toDisplayPath(change.path, this.config.cwd)} (${change.reason})`)
+                .join(", ");
+            const rest = unsupported.length - Math.min(unsupported.length, UNSUPPORTED_DETAIL_LIMIT);
+            console.error(`[agy-acp] WARN: ${unsupported.length} filesystem change(s) not reflected through ACP: ${named}` +
+                (rest > 0 ? `, and ${rest} more` : ""));
+        }
+    }
+    async runPromptCommand(command, prompt, onUpdate, fsBridge) {
+        const [program, ...args] = command;
+        // Snapshot existing conversation ids *before* spawning, so the file agy
+        // creates for a fresh prompt is guaranteed to look "new" once it appears —
+        // spawning after the snapshot would risk racing agy's own DB creation.
+        const snapshot = this.#conversationId === null ? conversationSnapshot(this.config.conversationsDir) : null;
+        // Same working-tree reconciliation as the interactive path: print-mode
+        // turns (`--dangerously-skip-permissions`, `--no-interactive-permissions`,
+        // etc.) still need shell / unrecognized edits reflected through ACP.
+        let editBaseline = null;
+        try {
+            editBaseline = await snapshotWorkingTree([this.config.cwd, ...this.config.additionalDirectories]);
+        }
+        catch {
+            editBaseline = null;
+        }
+        if (this.#cancelled)
+            return { stopReason: "cancelled" };
+        let child;
+        try {
+            child = this.spawnProcess(program, args, this.spawnOptions());
+        }
+        catch (error) {
+            throw this.errorForSpawnFailure(command, error);
+        }
+        this.#process = child;
+        // Cancel may have landed in the gap between snapshot and spawn assignment.
+        if (this.#cancelled) {
+            if (process.platform === "win32")
+                child.kill();
+            else
+                child.kill("SIGINT");
+            return { stopReason: "cancelled" };
+        }
+        const exitPromise = waitForExit(child);
+        const errorPromise = once(child, "error");
+        const stderrChunks = [];
+        // agy persists its output to its own conversation database; stdout carries
+        // nothing we read, but it must still be drained so the child can't block on
+        // a full pipe.
+        child.stdout.on("data", () => { });
+        child.stderr.on("data", (chunk) => {
+            stderrChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        });
+        const poller = new StreamPoller({
+            dir: this.config.conversationsDir,
+            conversationId: this.#conversationId,
+            baseStepIdx: this.#lastStepIdx,
+            baseGenMetadataIdx: this.#lastGenMetadataIdx,
+            skipNarration: false,
+            cwd: this.config.cwd,
+            snapshot
+        });
+        try {
+            child.stdin.end(this.config.promptInArgv ? undefined : prompt);
+            const pollOnce = async () => {
+                for (const update of poller.poll()) {
+                    await onUpdate(update);
+                    // Record what disk holds for the reported paths, so end-of-turn
+                    // reconciliation only reports what the client has *not* been told.
+                    // Only completed edits: pending/failed lifecycle updates describe
+                    // proposed content that may never land.
+                    const rawUpdate = update;
+                    if (isEditToolCall(update) && rawUpdate.status === "completed") {
+                        await this.observeReported(editBaseline, reportedContents(this.config.cwd, update));
+                    }
+                }
+            };
+            let polling = true;
+            let pollReject;
+            const pollErrorPromise = new Promise((_, reject) => {
+                pollReject = reject;
+            });
+            const pollLoop = (async () => {
+                try {
+                    while (polling) {
+                        await pollOnce();
+                        if (!polling)
+                            break;
+                        await sleep(POLL_INTERVAL_MS);
+                    }
+                }
+                catch (error) {
+                    pollReject?.(error);
+                    await this.cancel();
+                }
+            })();
+            pollLoop.catch(() => { });
+            const [exitCode] = child.exitCode === null
+                ? await Promise.race([
+                    this.raceProcessError(exitPromise, errorPromise, command),
+                    pollErrorPromise
+                ])
+                : [child.exitCode, null];
+            polling = false;
+            await pollLoop;
+            for (let attempt = 0; attempt < TRAILING_POLL_ATTEMPTS; attempt++) {
+                await pollOnce();
+                if (attempt < TRAILING_POLL_ATTEMPTS - 1)
+                    await sleep(TRAILING_POLL_DELAY_MS);
+            }
+            if (exitCode && !this.#cancelled) {
+                const stderr = Buffer.concat(stderrChunks).toString("utf8");
+                throw new AgyCliError(`agy exited with status ${exitCode}: ${stderr.trim() || "<no stderr>"}`, command, exitCode, stderr);
+            }
+            // Print-mode child may exit before background task rows finish writing.
+            // Keep draining the DB for this user turn only — no synthetic prompts.
+            // Re-arm the deadline on DB progress so long tasks can finish; still
+            // bound idle silence by printTimeout so a missing completion cannot hang.
+            if (poller.hasActiveBackgroundTasks && !this.#cancelled) {
+                const timeoutMs = parsePrintTimeoutMs(this.config.printTimeout);
+                let deadline = Date.now() + timeoutMs;
+                let seenRevision = poller.revision;
+                while (poller.hasActiveBackgroundTasks && !this.#cancelled) {
+                    if (Date.now() >= deadline) {
+                        break;
+                    }
+                    await sleep(POLL_INTERVAL_MS);
+                    // pollOnce (not a bare poll) so edits from background tasks are also
+                    // observed into the reconciliation baseline.
+                    await pollOnce();
+                    if (poller.revision !== seenRevision) {
+                        seenRevision = poller.revision;
+                        deadline = Date.now() + timeoutMs;
+                    }
+                }
+            }
+            if (editBaseline && !this.#cancelled) {
+                await this.reflectUnstructuredEdits(editBaseline, fsBridge, onUpdate);
+            }
+            const detectedStopReason = poller.detectStopReason();
+            const stopReason = this.#cancelled ? "cancelled" : detectedStopReason;
+            const usage = poller.accumulatedTurnUsage();
+            return { stopReason, usage };
+        }
+        finally {
+            this.#conversationId = poller.conversationId ?? this.#conversationId;
+            this.#lastStepIdx = Math.max(this.#lastStepIdx, poller.lastStepIdx);
+            this.#lastGenMetadataIdx = Math.max(this.#lastGenMetadataIdx, poller.lastGenMetadataIdx);
+            this.#lastPromptUserStepIdxs = poller.userStepIdxs;
+            poller.close();
+            if (this.#process === child) {
+                this.#process = undefined;
+            }
+        }
+    }
+    async raceProcessError(promise, errorPromise, command) {
+        return Promise.race([
+            promise,
+            errorPromise.then(([error]) => {
+                throw this.errorForSpawnFailure(command, error);
+            })
+        ]);
+    }
+    shouldInstallAfterError(error) {
+        return this.config.autoInstall &&
+            this.config.agyPath === "agy" &&
+            error instanceof AgyCliError &&
+            error.exitCode === null &&
+            isMissingExecutableError(error);
+    }
+    async installAgy() {
+        const installed = await ensureAgyInstalled({
+            env: this.config.env,
+            installBinDir: this.config.installBinDir,
+            warn: (message) => console.error(message)
+        });
+        if (!installed) {
+            throw new AgyCliError("agy executable not found and auto-install failed. Install the Google Antigravity CLI " +
+                "or add its directory to PATH.", [this.config.agyPath], null, "");
+        }
+    }
+    spawnOptions() {
+        const env = this.spawnEnv();
+        return env ? { cwd: this.config.cwd, env } : { cwd: this.config.cwd };
+    }
+    spawnEnv() {
+        const baseEnv = this.config.env;
+        if (!this.#extraPath) {
+            return baseEnv;
+        }
+        const source = baseEnv ?? process.env;
+        const currentPath = source.PATH ?? "";
+        const nextPath = currentPath
+            ? `${this.#extraPath}${path.delimiter}${currentPath}`
+            : this.#extraPath;
+        return { ...source, PATH: nextPath };
+    }
+    errorForSpawnFailure(command, error) {
+        const executable = command[0];
+        if (error.code === "ENOENT") {
+            const hint = executable === this.config.agyPath && executable === "agy"
+                ? "Install the Google Antigravity CLI or add its directory to PATH."
+                : `Check the configured executable path: ${executable}.`;
+            return new AgyCliError(`${executable} executable not found. ${hint}`, command, null, error.message);
+        }
+        return new AgyCliError(`${executable} failed to start: ${error.message}`, command, null, error.message);
+    }
+    async cancel() {
+        // Always mark cancelled first: a print-mode turn may still be in its
+        // pre-spawn working-tree snapshot, or draining background task rows after
+        // the child already exited — both loops only check `#cancelled` (the
+        // process handle alone is no longer enough to interrupt them).
+        this.#cancelled = true;
+        if (this.#cancelTurn) {
+            this.#cancelTurn();
+            // Interactive turns have a PTY to stop. Print turns also have a cancel
+            // waiter now, but must continue below and signal their child process.
+            if (this.#pty) {
+                await this.stopPty();
+                return;
+            }
+        }
+        if (this.#pty) {
+            await this.stopPty();
+            return;
+        }
+        const child = this.#process;
+        if (!child || child.exitCode !== null) {
+            return;
+        }
+        const exitPromise = once(child, "exit");
+        // SIGINT (rather than SIGTERM) gives agy a chance to flush its last
+        // conversation-database write before exiting. Windows has no real SIGINT,
+        // so fall back to an ungraceful kill there.
+        if (process.platform === "win32") {
+            child.kill();
+        }
+        else {
+            child.kill("SIGINT");
+        }
+        const timeout = setTimeout(() => {
+            if (child.exitCode === null) {
+                child.kill("SIGKILL");
+            }
+        }, 5000);
+        try {
+            if (child.exitCode === null) {
+                await exitPromise;
+            }
+        }
+        finally {
+            clearTimeout(timeout);
+        }
+    }
+    async stopPty() {
+        const pty = this.#pty;
+        const exit = this.#ptyExit;
+        if (this.#ptyPermissionRenderTimer)
+            clearTimeout(this.#ptyPermissionRenderTimer);
+        this.#ptyPermissionRenderTimer = undefined;
+        this.#ptyPermissionRender = "";
+        this.#ptyPermissionMarkerTail = "";
+        this.#ptyIdleMarkerTail = "";
+        this.#pty = undefined;
+        this.#ptyExit = undefined;
+        if (pty) {
+            try {
+                pty.kill();
+            }
+            catch { }
+            if (exit) {
+                const exited = await Promise.race([exit.then(() => true), sleep(2_000).then(() => false)]);
+                if (!exited) {
+                    try {
+                        pty.kill("SIGKILL");
+                    }
+                    catch { }
+                    await Promise.race([exit, sleep(500)]);
+                }
+            }
+        }
+    }
+    flushPermissionRender() {
+        const raw = this.#ptyPermissionMarkerTail + this.#ptyPermissionRender;
+        const { completed, incomplete } = splitIncompleteAnsi(raw);
+        const clean = completed.replace(/\x1b\[[0-9;?]*[a-zA-Z]|\x1b\].*?\x07|\x1b[()][AB012]/g, "");
+        const isPermissionContext = clean.includes("Yes, and always allow") ||
+            clean.includes("Select option:") ||
+            clean.includes("Allow this command?") ||
+            clean.includes("Allow this tool");
+        const visible = isPermissionContext && PERMISSION_MARKERS.some((marker) => clean.includes(marker));
+        const cleanTail = multiMarkerPrefixTail(clean, PERMISSION_MARKERS);
+        this.#ptyPermissionMarkerTail = cleanTail + incomplete;
+        if (visible) {
+            this.#ptyPermissionMarkerCount++;
+        }
+        this.#ptyPermissionRender = "";
+        this.#ptyPermissionRenderTimer = undefined;
+    }
+    async writePermissionKeys(keys) {
+        if (this.#cancelled)
+            return false;
+        const down = "\x1b[B";
+        let offset = 0;
+        while (keys.startsWith(down, offset)) {
+            this.#pty?.write(down);
+            offset += down.length;
+            if (offset < keys.length) {
+                await sleep(PERMISSION_KEY_DELAY_MS);
+                if (this.#cancelled)
+                    return false;
+            }
+        }
+        this.#pty?.write(keys.slice(offset));
+        return true;
+    }
+    async close() {
+        await this.cancel();
+    }
+}
+function splitIncompleteAnsi(input) {
+    const match = input.match(/\x1b(?:\[[0-9;?]*|\][^\x07]*|[()][AB012]?)?$/);
+    if (match && match.index !== undefined && match[0].length > 0) {
+        return {
+            completed: input.slice(0, match.index),
+            incomplete: match[0]
+        };
+    }
+    return { completed: input, incomplete: "" };
+}
+const PERMISSION_MARKERS = [
+    "Yes, and always allow",
+    "Always allow",
+    "Allow this tool",
+    "Allow this command",
+    "Allow once",
+    "Allow this time",
+    "Yes, allow"
+];
+function markerPrefixTail(output, marker) {
+    const max = Math.min(output.length, marker.length - 1);
+    for (let length = max; length > 0; length--) {
+        const suffix = output.slice(-length);
+        if (marker.startsWith(suffix))
+            return suffix;
+    }
+    return "";
+}
+function multiMarkerPrefixTail(output, markers) {
+    let longest = "";
+    for (const marker of markers) {
+        const tail = markerPrefixTail(output, marker);
+        if (tail.length > longest.length) {
+            longest = tail;
+        }
+    }
+    return longest;
+}
+export class AgyCliBackend {
+    spawnProcess;
+    ptyFactory;
+    constructor(spawnProcess = defaultSpawnFactory, ptyFactory) {
+        this.spawnProcess = spawnProcess;
+        this.ptyFactory = ptyFactory;
+    }
+    async startSession(config) {
+        return new AgyCliSession(config, this.spawnProcess, this.ptyFactory);
+    }
+    async listModels(config) {
+        const command = [config.agyPath, "models"];
+        let child;
+        try {
+            child = this.spawnProcess(command[0], command.slice(1), { cwd: config.cwd, env: config.env });
+        }
+        catch (error) {
+            throw errorForSpawnFailure(command, error);
+        }
+        child.stdin.end();
+        const stdoutChunks = [];
+        const stderrChunks = [];
+        const exitPromise = waitForExit(child);
+        const stdoutDone = once(child.stdout, "end").catch(() => undefined);
+        const stderrDone = once(child.stderr, "end").catch(() => undefined);
+        const errorPromise = once(child, "error");
+        let timedOut = false;
+        const timeout = setTimeout(() => {
+            timedOut = true;
+            child.kill("SIGTERM");
+            setTimeout(() => {
+                if (child.exitCode === null) {
+                    child.kill("SIGKILL");
+                }
+            }, 5000).unref();
+        }, config.modelListTimeoutMs);
+        child.stdout.on("data", (chunk) => {
+            stdoutChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        });
+        child.stderr.on("data", (chunk) => {
+            stderrChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        });
+        try {
+            const [exitCode] = child.exitCode === null
+                ? await raceProcessError(exitPromise, errorPromise, command)
+                : [child.exitCode, null];
+            if (timedOut) {
+                throw new AgyCliError("agy models timed out", command, null, "");
+            }
+            if (exitCode) {
+                const stderr = Buffer.concat(stderrChunks).toString("utf8");
+                throw new AgyCliError(`agy models exited with status ${exitCode}: ${stderr.trim() || "<no stderr>"}`, command, exitCode, stderr);
+            }
+            await Promise.allSettled([stdoutDone, stderrDone]);
+        }
+        finally {
+            clearTimeout(timeout);
+        }
+        const stdout = Buffer.concat(stdoutChunks).toString("utf8");
+        return parseAgyModels(stdout);
+    }
+}
+export function configFromEnv(input) {
+    const env = input.env ?? process.env;
+    const argv = input.argv ?? [];
+    let sandbox = true;
+    if (argv.includes("--no-sandbox")) {
+        sandbox = false;
+    }
+    if (argv.includes("--sandbox")) {
+        sandbox = true;
+    }
+    let skipPermissions = false;
+    if (argv.includes("--dangerously-skip-permissions")) {
+        skipPermissions = true;
+    }
+    // Interactive permission forwarding is the normal execution path. The
+    // explicit dangerous bypass selects print mode because there is no
+    // permission request to forward when agy auto-approves everything.
+    const interactiveDisabled = argv.includes("--no-interactive-permissions");
+    const interactivePermissions = !skipPermissions && !interactiveDisabled;
+    let mode = "default";
+    const modeFlagIdx = argv.indexOf("--mode");
+    if (modeFlagIdx >= 0) {
+        const modeArg = argv[modeFlagIdx + 1];
+        if (modeArg && isSessionModeId(modeArg)) {
+            mode = modeArg;
+        }
+    }
+    return {
+        cwd: input.cwd,
+        additionalDirectories: input.additionalDirectories ?? [],
+        agyPath: optional(env.AGY_BIN) ?? "agy",
+        model: undefined,
+        effort: undefined,
+        mode,
+        project: undefined,
+        printTimeout: "5m0s",
+        sandbox,
+        skipPermissions,
+        interactivePermissions,
+        logFile: undefined,
+        promptInArgv: true,
+        autoInstall: false,
+        installBinDir: defaultInstallBinDir(env),
+        modelList: [],
+        discoverModels: true,
+        modelListTimeoutMs: DEFAULT_AGY_MODEL_LIST_TIMEOUT_MS,
+        conversationsDir: input.conversationsDir ?? DEFAULT_CONVERSATIONS_DIR,
+        env
+    };
+}
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+function defaultSpawnFactory(command, args, options) {
+    return spawn(command, args, {
+        cwd: options.cwd,
+        env: options.env,
+        stdio: ["pipe", "pipe", "pipe"]
+    });
+}
+export async function defaultPtyFactory() {
+    if (process.platform !== "win32") {
+        const packageRoot = path.dirname(path.dirname(fileURLToPath(import.meta.resolve("node-pty"))));
+        const nativeDirs = [
+            path.join(packageRoot, "build", "Release"),
+            path.join(packageRoot, "build", "Debug"),
+            path.join(packageRoot, "prebuilds", `${process.platform}-${process.arch}`)
+        ];
+        const nativeDir = nativeDirs.find((dir) => existsSync(path.join(dir, "pty.node")));
+        const helper = nativeDir && path.join(nativeDir, "spawn-helper");
+        const helperMode = helper && existsSync(helper) ? statSync(helper).mode : undefined;
+        if (helper && helperMode !== undefined && (helperMode & 0o111) === 0) {
+            // node-pty 1.1.0's npm tarball loses this executable bit on some npm
+            // clients. Its native addon invokes the helper directly, so repair the
+            // packaged mode before the first spawn.
+            try {
+                chmodSync(helper, helperMode | 0o111);
+            }
+            catch (error) {
+                throw new Error(`node-pty spawn-helper is not executable and could not be repaired at ${helper}: ${error instanceof Error ? error.message : String(error)}`);
+            }
+        }
+    }
+    // @ts-ignore optional runtime dependency
+    const pty = await import("node-pty");
+    return { spawn: (command, args, options) => pty.spawn(command, args, { ...options, name: "xterm-256color" }) };
+}
+function optional(value) {
+    const trimmed = value?.trim();
+    return trimmed ? trimmed : undefined;
+}
+/** Parse Go duration forms used by agy (for example 5m0s and 30s). */
+function parsePrintTimeoutMs(value) {
+    const source = value.trim();
+    let total = 0;
+    let consumed = "";
+    for (const match of source.matchAll(/(\d+(?:\.\d+)?)(ms|h|m|s)/g)) {
+        consumed += match[0];
+        const scale = match[2] === "h" ? 3_600_000 : match[2] === "m" ? 60_000 : match[2] === "s" ? 1_000 : 1;
+        total += Number(match[1]) * scale;
+    }
+    return consumed === source && total > 0 ? total : 5 * 60_000;
+}
+export function parseAgyModels(output) {
+    const lines = output
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .filter((line) => !isAgyStatusLine(line));
+    return dedupe(lines);
+}
+function unsupportedInteractionDetail(toolName, toolCall, options) {
+    if (toolName === "ask_question") {
+        const ask = parseAskQuestion(toolCall);
+        if (!ask)
+            return "ask_question payload could not be parsed";
+        if (ask.questionCount === 0)
+            return "ask_question has no questions";
+        if (ask.questions.some((q) => q.options.length === 0))
+            return "ask_question has a question with no selectable options";
+        return "ask_question could not be bridged";
+    }
+    return "only standard permission menus (run_command, ask_permission, manage_task, file read/write) and ask_question can be bridged safely";
+}
+function isAgyStatusLine(line) {
+    return line === "Fetching available models..." ||
+        /^[IWEF]\d{4}\s/.test(line) ||
+        line.includes("You are not logged into Antigravity") ||
+        line.includes("Failed to") ||
+        line.startsWith("error ");
+}
+function waitForExit(child) {
+    return new Promise((resolve) => {
+        child.once("exit", (code, signal) => resolve([code, signal]));
+    });
+}
+function raceProcessError(promise, errorPromise, command) {
+    return Promise.race([
+        promise,
+        errorPromise.then(([error]) => {
+            throw errorForSpawnFailure(command, error);
+        })
+    ]);
+}
+function errorForSpawnFailure(command, error) {
+    const executable = command[0];
+    if (error.code === "ENOENT") {
+        return new AgyCliError(`${executable} executable not found. Check the configured executable path: ${executable}.`, command, null, error.message);
+    }
+    return new AgyCliError(`${executable} failed to start: ${error.message}`, command, null, error.message);
+}
+function dedupe(values) {
+    return [...new Set(values)];
+}
+function isMissingExecutableError(error) {
+    return error.stderr.includes("ENOENT") || error.message.includes("executable not found");
+}
+//# sourceMappingURL=cli.js.map
