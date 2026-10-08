@@ -46,6 +46,14 @@ const TRAILING_POLL_DELAY_MS = 100;
 const PERMISSION_RENDER_SETTLE_MS = 20;
 const PERMISSION_KEY_DELAY_MS = 50;
 const QUIESCENT_SETTLE_MS = 300;
+/**
+ * agy's input footer is the ground truth for "turn over": it is drawn only
+ * when the TUI returns to a free prompt. DB step state alone cannot tell a
+ * completed narration row (stepType 15 lands before every tool call) from the
+ * final answer — the next step reaches SQLite only after the following
+ * generation finishes, so any quiescence window races model latency.
+ */
+const TURN_IDLE_MARKER = "? for shortcuts";
 
 /** Signature of the permission decision agy has recorded for a gated step.
  *  A re-armed status-9 prompt (e.g. the next segment of `a && b`) changes this
@@ -234,6 +242,8 @@ export class AgyCliSession {
   #ptyPermissionMarkerCount = 0;
   #ptyPermissionRender = "";
   #ptyPermissionMarkerTail = "";
+  #ptyIdleMarkerAt = 0;
+  #ptyIdleMarkerTail = "";
   #ptyPermissionRenderTimer: ReturnType<typeof setTimeout> | undefined;
   #activeStreamPoller: StreamPoller | undefined;
   #ptyConfig = "";
@@ -452,9 +462,15 @@ export class AgyCliSession {
       this.#ptyPermissionMarkerCount = 0;
       this.#ptyPermissionRender = "";
       this.#ptyPermissionMarkerTail = "";
+      this.#ptyIdleMarkerAt = 0;
+      this.#ptyIdleMarkerTail = "";
       const activePty = this.#pty;
       activePty.onData((data) => {
         if (this.#pty !== activePty) return;
+        const { completed: idleData, incomplete: idleIncomplete } = splitIncompleteAnsi(this.#ptyIdleMarkerTail + data);
+        const idleClean = idleData.replace(/\x1b\[[0-9;?]*[a-zA-Z]|\x1b\].*?\x07|\x1b[()][AB012]/g, "");
+        if (idleClean.includes(TURN_IDLE_MARKER)) this.#ptyIdleMarkerAt = Date.now();
+        this.#ptyIdleMarkerTail = markerPrefixTail(idleClean, TURN_IDLE_MARKER) + idleIncomplete;
         this.#ptyPermissionRender = (this.#ptyPermissionRender + data).slice(-16_384);
         if (this.#ptyPermissionRenderTimer) clearTimeout(this.#ptyPermissionRenderTimer);
         this.#ptyPermissionRenderTimer = setTimeout(
@@ -484,6 +500,11 @@ export class AgyCliSession {
     const timeoutMs = parsePrintTimeoutMs(this.config.printTimeout);
     let deadline = Date.now() + timeoutMs;
     let candidateRevision = -1;
+    // Only a footer repaint after the DB last looked unfinished proves agy
+    // returned to its prompt: repaints mid-turn land on busy observations and
+    // keep moving this boundary forward, so they can never satisfy the gate
+    // for a later turn-complete candidate.
+    let busyBoundaryAt = Date.now();
     let seenRevision = -1;
     let lastActivityTime = Date.now();
     let failed = false;
@@ -496,7 +517,11 @@ export class AgyCliSession {
           candidateRevision = poller.turnCompleteCandidate ? poller.revision : -1;
           deadline = Date.now() + timeoutMs;
           lastActivityTime = Date.now();
-        } else if (!poller.turnCompleteCandidate) candidateRevision = -1;
+        }
+        if (!poller.turnCompleteCandidate) {
+          candidateRevision = -1;
+          busyBoundaryAt = Date.now();
+        }
         if (updates.length > 0) {
           lastActivityTime = Date.now();
         }
@@ -675,11 +700,19 @@ export class AgyCliSession {
           lastActivityTime = Date.now();
         }
         const hasQuiesced = (Date.now() - lastActivityTime) >= QUIESCENT_SETTLE_MS;
+        // DB state says the turn *looks* done — but a completed narration row
+        // is indistinguishable from the final answer while agy is still
+        // generating the next step. Only a TUI footer repaint since the DB
+        // last looked unfinished proves the prompt is really back; a missed
+        // redraw still resolves through the printTimeout deadline path
+        // instead of hanging forever.
+        const sawIdleMarker = this.#ptyIdleMarkerAt >= busyBoundaryAt;
         const isIdleCandidate =
           poller.turnCompleteCandidate &&
           poller.lastStepIdx > this.#lastStepIdx &&
           candidateRevision === poller.revision &&
           hasQuiesced &&
+          sawIdleMarker &&
           (poller.isConclusiveTurnEnd || poller.isSuccessfulToolOnlyEnd);
         if (isIdleCandidate) {
           // Background work can finish after the TUI looks idle. Stay on this
@@ -1109,6 +1142,7 @@ export class AgyCliSession {
     this.#ptyPermissionRenderTimer = undefined;
     this.#ptyPermissionRender = "";
     this.#ptyPermissionMarkerTail = "";
+    this.#ptyIdleMarkerTail = "";
     this.#pty = undefined;
     this.#ptyExit = undefined;
     if (pty) {
