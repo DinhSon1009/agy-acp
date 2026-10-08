@@ -467,10 +467,12 @@ export class AgyCliSession {
       const activePty = this.#pty;
       activePty.onData((data) => {
         if (this.#pty !== activePty) return;
-        const { completed: idleData, incomplete: idleIncomplete } = splitIncompleteAnsi(this.#ptyIdleMarkerTail + data);
-        const idleClean = idleData.replace(/\x1b\[[0-9;?]*[a-zA-Z]|\x1b\].*?\x07|\x1b[()][AB012]/g, "");
-        if (idleClean.includes(TURN_IDLE_MARKER)) this.#ptyIdleMarkerAt = Date.now();
-        this.#ptyIdleMarkerTail = markerPrefixTail(idleClean, TURN_IDLE_MARKER) + idleIncomplete;
+        // Keep these locals namespaced: host integrations inject their own
+        // idleData/idleClean scan at the #ptyPermissionRender anchor below.
+        const { completed: turnIdleData, incomplete: turnIdleIncomplete } = splitIncompleteAnsi(this.#ptyIdleMarkerTail + data);
+        const turnIdleClean = turnIdleData.replace(/\x1b\[[0-9;?]*[a-zA-Z]|\x1b\].*?\x07|\x1b[()][AB012]/g, "");
+        if (turnIdleClean.includes(TURN_IDLE_MARKER)) this.#ptyIdleMarkerAt = Date.now();
+        this.#ptyIdleMarkerTail = markerPrefixTail(turnIdleClean, TURN_IDLE_MARKER) + turnIdleIncomplete;
         this.#ptyPermissionRender = (this.#ptyPermissionRender + data).slice(-16_384);
         if (this.#ptyPermissionRenderTimer) clearTimeout(this.#ptyPermissionRenderTimer);
         this.#ptyPermissionRenderTimer = setTimeout(
